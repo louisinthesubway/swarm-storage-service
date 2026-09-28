@@ -17,6 +17,8 @@ import io.dropwizard.auth.PolymorphicAuthDynamicFeature;
 import io.dropwizard.auth.PolymorphicAuthValueFactoryProvider;
 import io.dropwizard.auth.basic.BasicCredentialAuthFilter;
 import io.dropwizard.auth.basic.BasicCredentials;
+import io.dropwizard.configuration.EnvironmentVariableSubstitutor;
+import io.dropwizard.configuration.SubstitutingSourceProvider;
 import io.dropwizard.core.Application;
 import io.dropwizard.core.setup.Bootstrap;
 import io.dropwizard.core.setup.Environment;
@@ -59,12 +61,21 @@ public class StorageService extends Application<StorageServiceConfiguration> {
   /// its configuration from the named secret and will ignore (but still require) the configuration file argument.
   private static final String CONFIG_URI_ENVIRONMENT_VARIABLE = "STORAGE_SERVICE_CONFIG_URI";
 
+  // SWARM: upstream only reads a plain config file, or (if STORAGE_SERVICE_CONFIG_URI is set) a whole
+  // YAML document fetched from Google Secret Manager. Neither lets a self-hosted deployment keep secret
+  // *values* out of the config file it commits. When STORAGE_SERVICE_CONFIG_URI is unset, wrap the
+  // default file source with Dropwizard's own SubstitutingSourceProvider so storage.yml can reference
+  // ${SWARM_...} environment variables (with optional ":-default" fallbacks), the same convention
+  // swarm-messenger-server's staging.yml already uses. See docs/SWARM-CHANGES.md.
   @Override
   public void initialize(final Bootstrap<StorageServiceConfiguration> bootstrap) {
     final String configurationUri = System.getenv(CONFIG_URI_ENVIRONMENT_VARIABLE);
 
     if (StringUtils.isNotBlank(configurationUri)) {
       bootstrap.setConfigurationSourceProvider(new SecretManagerConfigurationSourceProvider(configurationUri));
+    } else {
+      bootstrap.setConfigurationSourceProvider(new SubstitutingSourceProvider(
+          bootstrap.getConfigurationSourceProvider(), new EnvironmentVariableSubstitutor(false)));
     }
   }
 
@@ -75,7 +86,26 @@ public class StorageService extends Application<StorageServiceConfiguration> {
 
     UncaughtExceptionHandler.register();
 
-    BigtableDataSettings bigtableDataSettings = BigtableDataSettings.newBuilder()
+    // SWARM: a self-hosted deployment has no Google Cloud project, so point the Bigtable client at
+    // an emulator (docs/STAGING.md, section 5c) when BIGTABLE_EMULATOR_HOST is set, instead of the
+    // real Bigtable Data API newBuilder() always dials. newBuilderForEmulator() is upstream's own
+    // supported entry point for this (used by BigtableEmulatorExtension in this repo's own tests);
+    // nothing about the zkgroup or authentication code below changes. See docs/SWARM-CHANGES.md.
+    final String bigtableEmulatorHost = System.getenv("BIGTABLE_EMULATOR_HOST");
+    final BigtableDataSettings.Builder bigtableDataSettingsBuilder;
+    if (StringUtils.isNotBlank(bigtableEmulatorHost)) {
+      final String[] hostAndPort = bigtableEmulatorHost.split(":", 2);
+      if (hostAndPort.length != 2) {
+        throw new IllegalArgumentException(
+            "BIGTABLE_EMULATOR_HOST must be host:port, was: " + bigtableEmulatorHost);
+      }
+      bigtableDataSettingsBuilder = BigtableDataSettings.newBuilderForEmulator(hostAndPort[0],
+          Integer.parseInt(hostAndPort[1]));
+    } else {
+      bigtableDataSettingsBuilder = BigtableDataSettings.newBuilder();
+    }
+
+    BigtableDataSettings bigtableDataSettings = bigtableDataSettingsBuilder
                                                                     .setProjectId(config.getBigTableConfiguration().getProjectId())
                                                                     .setInstanceId(config.getBigTableConfiguration().getInstanceId())
                                                                     .build();

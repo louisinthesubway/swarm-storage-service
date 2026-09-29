@@ -292,7 +292,12 @@ server.
 repository. It reads the four Bigtable tables (the emulator, through `BIGTABLE_EMULATOR_HOST`)
 and writes the same records into the FoundationDB layout above.
 
-- Dry run unless `--apply` is given: it reads both sides and prints what it would do.
+- Dry run unless `--apply` is given: it reads both sides and prints what it would do, and writes
+  nothing anywhere. It opens the FoundationDB directory in a read-only transaction and, if the
+  directory does not exist yet, compares with nothing (every readable row counts as "would
+  copy") instead of creating it. (Until 2026-09-29, `3f3b61b23`, the dry run opened the
+  directory with `createOrOpen`, so a first dry run created the empty directory, and the
+  Directory layer's version key in a cluster that had never used it.)
 - Prints per table: rows in the source, records in the target before, copied (or "would copy"),
   already identical, conflicts, unreadable rows, and records in the target after.
 - Idempotent: a record that already exists in FoundationDB with identical bytes is left alone;

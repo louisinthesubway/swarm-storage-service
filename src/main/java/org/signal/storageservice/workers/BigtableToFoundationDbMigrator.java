@@ -25,7 +25,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.function.Predicate;
+import javax.annotation.Nullable;
 import org.signal.storageservice.configuration.BigTableConfiguration;
 import org.signal.storageservice.storage.GroupLogTable;
 import org.signal.storageservice.storage.GroupsTable;
@@ -43,7 +45,9 @@ import org.signal.storageservice.util.Conversions;
 /// section 3.4. Section 3.9 there describes the command around it.
 ///
 /// - Reads Bigtable only; never writes or deletes anything there.
-/// - Dry run unless `apply`: the target is read, never written.
+/// - Dry run unless `apply`: the target is read, never written. A dry run gets no target at all when the
+///   FoundationDB directory does not exist yet (the command opens it read-only, [FoundationDbStorage#openIfExists]);
+///   then every readable row counts as "would copy".
 /// - A record missing in FoundationDB is copied. A record that exists with exactly the same bytes is counted as
 ///   identical and left alone. A record that exists with different bytes is a conflict and is never overwritten
 ///   (FoundationDB is then the newer side). So running it again changes nothing.
@@ -106,7 +110,8 @@ public class BigtableToFoundationDbMigrator {
   }
 
   /// How one Bigtable table maps onto one FoundationDB subdirectory.
-  private record DataSet(String name, String bigtableTable, Subspace subspace,
+  /// `subspace` is null for a dry run against a directory that does not exist yet.
+  private record DataSet(String name, String bigtableTable, @Nullable Subspace subspace,
                          RowConverter converter, Predicate<Tuple> recordMarker) {
   }
 
@@ -119,15 +124,27 @@ public class BigtableToFoundationDbMigrator {
 
   private final BigtableDataClient source;
   private final BigTableConfiguration sourceTables;
+  @Nullable
   private final FoundationDbStorage target;
+  private final List<String> targetDirectory;
   private final PrintStream out;
 
   public BigtableToFoundationDbMigrator(final BigtableDataClient source, final BigTableConfiguration sourceTables,
       final FoundationDbStorage target, final PrintStream out) {
 
+    this(source, sourceTables, target, target.getDirectory(), out);
+  }
+
+  /// @param target          the FoundationDB storage, or `null` for a dry run against a directory that does not
+  ///                        exist yet
+  /// @param targetDirectory the configured FoundationDB directory, for the report
+  public BigtableToFoundationDbMigrator(final BigtableDataClient source, final BigTableConfiguration sourceTables,
+      @Nullable final FoundationDbStorage target, final List<String> targetDirectory, final PrintStream out) {
+
     this.source = source;
     this.sourceTables = sourceTables;
     this.target = target;
+    this.targetDirectory = List.copyOf(targetDirectory);
     this.out = out;
   }
 
@@ -135,20 +152,24 @@ public class BigtableToFoundationDbMigrator {
   ///
   /// @return one report per data set, in the order groups, group logs, storage manifests, storage items
   public List<TableReport> run(final boolean apply) {
+    if (apply && target == null) {
+      throw new IllegalArgumentException("copying needs the FoundationDB directory; only a dry run may go without it");
+    }
+
     final List<DataSet> dataSets = List.of(
-        new DataSet(FoundationDbStorage.GROUPS, sourceTables.getGroupsTableId(), target.getGroups(),
+        new DataSet(FoundationDbStorage.GROUPS, sourceTables.getGroupsTableId(), subspace(FoundationDbStorage::getGroups),
             BigtableToFoundationDbMigrator::convertGroup,
             // (group id, "ver")
             key -> key.size() == 2 && FoundationDbGroupsTable.COLUMN_VERSION.equals(key.get(1))),
-        new DataSet(FoundationDbStorage.GROUP_LOGS, sourceTables.getGroupLogsTableId(), target.getGroupLogs(),
+        new DataSet(FoundationDbStorage.GROUP_LOGS, sourceTables.getGroupLogsTableId(), subspace(FoundationDbStorage::getGroupLogs),
             BigtableToFoundationDbMigrator::convertGroupLogEntry,
             // (group id, version, "v")
             key -> key.size() == 3 && FoundationDbGroupLogTable.COLUMN_VERSION.equals(key.get(2))),
         new DataSet(FoundationDbStorage.STORAGE_MANIFESTS, sourceTables.getContactManifestsTableId(),
-            target.getStorageManifests(), BigtableToFoundationDbMigrator::convertManifest,
+            subspace(FoundationDbStorage::getStorageManifests), BigtableToFoundationDbMigrator::convertManifest,
             // (uuid, "ver")
             key -> key.size() == 2 && FoundationDbStorageManifestsTable.COLUMN_VERSION.equals(key.get(1))),
-        new DataSet(FoundationDbStorage.STORAGE_ITEMS, sourceTables.getContactsTableId(), target.getStorageItems(),
+        new DataSet(FoundationDbStorage.STORAGE_ITEMS, sourceTables.getContactsTableId(), subspace(FoundationDbStorage::getStorageItems),
             BigtableToFoundationDbMigrator::convertItem,
             // (uuid, item key, 0): the first chunk of an item
             key -> key.size() == 3 && Long.valueOf(0).equals(key.get(2))));
@@ -156,8 +177,9 @@ public class BigtableToFoundationDbMigrator {
     out.printf("migrate-bigtable-to-foundationdb: %s%n", apply
         ? "APPLY: records missing in FoundationDB are copied; nothing is overwritten or deleted"
         : "DRY RUN: nothing is written (add --apply to copy)");
-    out.printf("source: Bigtable project %s, instance %s; target: FoundationDB directory %s%n",
-        sourceTables.getProjectId(), sourceTables.getInstanceId(), target.getDirectory());
+    out.printf("source: Bigtable project %s, instance %s; target: FoundationDB directory %s%s%n",
+        sourceTables.getProjectId(), sourceTables.getInstanceId(), targetDirectory,
+        target == null ? " (does not exist yet: nothing to compare, every readable row would be copied)" : "");
 
     final List<TableReport> reports = new ArrayList<>();
     for (final DataSet dataSet : dataSets) {
@@ -166,6 +188,11 @@ public class BigtableToFoundationDbMigrator {
 
     printReport(reports, apply);
     return reports;
+  }
+
+  @Nullable
+  private Subspace subspace(final Function<FoundationDbStorage, Subspace> subdirectory) {
+    return target == null ? null : subdirectory.apply(target);
   }
 
   private TableReport migrate(final DataSet dataSet, final boolean apply) {
@@ -218,8 +245,13 @@ public class BigtableToFoundationDbMigrator {
 
   /// Compares a batch of records with FoundationDB in one transaction and, if `apply`, writes the missing ones in
   /// that same transaction.
-  private List<Outcome> flush(final Subspace subspace, final List<TargetRecord> records, final boolean apply) {
+  private List<Outcome> flush(@Nullable final Subspace subspace, final List<TargetRecord> records, final boolean apply) {
     final List<TargetRecord> snapshot = List.copyOf(records);
+
+    if (subspace == null) {
+      // a dry run against a directory that does not exist yet
+      return snapshot.stream().map(ignored -> Outcome.COPIED).toList();
+    }
 
     if (apply) {
       return target.write((transaction, mayHaveCommitted) -> readAll(transaction, subspace, snapshot)
@@ -266,7 +298,11 @@ public class BigtableToFoundationDbMigrator {
 
   /// Counts the records of a subdirectory: the keys that `recordMarker` accepts, one per record. Reads page by page,
   /// each page in its own read transaction.
-  long countRecords(final Subspace subspace, final Predicate<Tuple> recordMarker) {
+  long countRecords(@Nullable final Subspace subspace, final Predicate<Tuple> recordMarker) {
+    if (subspace == null) {
+      return 0;
+    }
+
     long count = 0;
     byte[] begin = subspace.range().begin;
     final byte[] end = subspace.range().end;

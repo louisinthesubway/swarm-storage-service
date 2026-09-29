@@ -17,6 +17,7 @@ import com.apple.foundationdb.subspace.Subspace;
 import io.dropwizard.lifecycle.Managed;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -73,14 +74,7 @@ public class FoundationDbStorage implements Managed {
   public static FoundationDbStorage open(final FoundationDbConfiguration configuration,
       final boolean disableShutdownHook) {
 
-    final FDB fdb = FDB.selectAPIVersion(FoundationDbVersion.getFoundationDbApiVersion());
-    if (disableShutdownHook) {
-      fdb.disableShutdownHook();
-    }
-
-    final Database database = fdb.open(configuration.clusterFile());
-    database.options().setTransactionTimeout(configuration.transactionTimeout().toMillis());
-    database.options().setTransactionRetryLimit(configuration.transactionRetryLimit());
+    final Database database = openDatabase(configuration, disableShutdownHook);
 
     try {
       final FoundationDbStorage storage = open(database, configuration.directory(), true).join();
@@ -92,6 +86,59 @@ public class FoundationDbStorage implements Managed {
       database.close();
       throw e;
     }
+  }
+
+  /// Opens the cluster named by `configuration.clusterFile()`, with the configured transaction timeout and retry
+  /// limit, and touches nothing in it.
+  ///
+  /// @param disableShutdownHook see [#open(FoundationDbConfiguration, boolean)]
+  public static Database openDatabase(final FoundationDbConfiguration configuration,
+      final boolean disableShutdownHook) {
+
+    final FDB fdb = FDB.selectAPIVersion(FoundationDbVersion.getFoundationDbApiVersion());
+    if (disableShutdownHook) {
+      fdb.disableShutdownHook();
+    }
+
+    final Database database = fdb.open(configuration.clusterFile());
+    database.options().setTransactionTimeout(configuration.transactionTimeout().toMillis());
+    database.options().setTransactionRetryLimit(configuration.transactionRetryLimit());
+    return database;
+  }
+
+  /// Opens `directory` and its four subdirectories if all of them exist, in one read-only transaction: unlike
+  /// [#open(Database, List, boolean)], this never writes anything, not even the Directory layer's own version key in a
+  /// cluster that has never used the Directory layer. The migration's dry run uses it.
+  ///
+  /// @param ownsDatabase whether [#stop()] should close `database`
+  /// @return the storage, or empty if the directory or any of its subdirectories does not exist
+  public static CompletableFuture<Optional<FoundationDbStorage>> openIfExists(final Database database,
+      final List<String> directory, final boolean ownsDatabase) {
+
+    return database.readAsync(transaction -> {
+          final List<DirectorySubspace> subdirectories = new ArrayList<>();
+          CompletableFuture<Boolean> chain = CompletableFuture.completedFuture(true);
+
+          // One after the other, as in open(); stop at the first missing one.
+          for (final String subdirectory : SUBDIRECTORIES) {
+            final List<String> path = Stream.concat(directory.stream(), Stream.of(subdirectory)).toList();
+            chain = chain.thenCompose(allExist -> !allExist
+                ? CompletableFuture.completedFuture(false)
+                : DirectoryLayer.getDefault().exists(transaction, path).thenCompose(exists -> !exists
+                    ? CompletableFuture.completedFuture(false)
+                    : DirectoryLayer.getDefault().open(transaction, path).thenApply(opened -> {
+                      subdirectories.add(opened);
+                      return true;
+                    })));
+          }
+
+          return chain.thenApply(allExist -> allExist
+              ? Optional.of(List.copyOf(subdirectories))
+              : Optional.<List<DirectorySubspace>>empty());
+        })
+        .thenApply(maybeSubdirectories -> maybeSubdirectories.map(subdirectories -> new FoundationDbStorage(database,
+            directory, subdirectories.get(0), subdirectories.get(1), subdirectories.get(2), subdirectories.get(3),
+            ownsDatabase)));
   }
 
   /// Creates (if needed) and opens `directory` and its four subdirectories in one transaction.

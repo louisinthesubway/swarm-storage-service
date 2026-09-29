@@ -5,6 +5,7 @@
 
 package org.signal.storageservice.workers;
 
+import com.apple.foundationdb.Database;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
 import io.dropwizard.core.cli.ConfiguredCommand;
 import io.dropwizard.core.setup.Bootstrap;
@@ -20,7 +21,8 @@ import org.signal.storageservice.storage.foundationdb.FoundationDbStorage;
 /// SWARM: `migrate-bigtable-to-foundationdb [--apply] <config.yml>`. Copies groups, group logs, storage manifests and
 /// storage items from the Bigtable tables named in the configuration's `bigtable:` block (the emulator, through
 /// `BIGTABLE_EMULATOR_HOST`) into the FoundationDB directory named in `storage.foundationdb`, whatever
-/// `storage.backend` says. A dry run unless `--apply` is given; idempotent; never deletes from Bigtable. See
+/// `storage.backend` says. A dry run unless `--apply` is given, and a dry run writes nothing anywhere (it does not
+/// even create the FoundationDB directory); idempotent; never deletes from Bigtable. See
 /// [BigtableToFoundationDbMigrator] and docs/SWARM-CHANGES.md, section 3.9.
 public class MigrateBigtableToFoundationDbCommand extends ConfiguredCommand<StorageServiceConfiguration> {
 
@@ -57,14 +59,17 @@ public class MigrateBigtableToFoundationDbCommand extends ConfiguredCommand<Stor
     }
 
     final List<BigtableToFoundationDbMigrator.TableReport> reports;
-    try (final BigtableDataClient source = BigtableClients.create(configuration.getBigTableConfiguration())) {
-      final FoundationDbStorage target = FoundationDbStorage.open(foundationDbConfiguration, false);
-      try {
-        reports = new BigtableToFoundationDbMigrator(source, configuration.getBigTableConfiguration(), target,
-            System.out).run(apply);
-      } finally {
-        target.stop();
-      }
+    try (final BigtableDataClient source = BigtableClients.create(configuration.getBigTableConfiguration());
+        final Database database = FoundationDbStorage.openDatabase(foundationDbConfiguration, false)) {
+
+      // A dry run only reads FoundationDB: it opens the directory read-only and, if it does not exist yet, compares
+      // with nothing instead of creating it. Copying creates it, as the service does at start.
+      final FoundationDbStorage target = apply
+          ? FoundationDbStorage.open(database, foundationDbConfiguration.directory(), false).join()
+          : FoundationDbStorage.openIfExists(database, foundationDbConfiguration.directory(), false).join().orElse(null);
+
+      reports = new BigtableToFoundationDbMigrator(source, configuration.getBigTableConfiguration(), target,
+          foundationDbConfiguration.directory(), System.out).run(apply);
     }
 
     final long problems = reports.stream()

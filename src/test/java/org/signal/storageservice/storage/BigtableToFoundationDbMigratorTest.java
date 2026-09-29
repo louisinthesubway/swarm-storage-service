@@ -6,7 +6,10 @@
 package org.signal.storageservice.storage;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.apple.foundationdb.Database;
+import com.apple.foundationdb.directory.DirectoryLayer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.cloud.bigtable.admin.v2.BigtableTableAdminClient;
 import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
@@ -21,6 +24,7 @@ import com.google.cloud.bigtable.data.v2.models.RowMutation;
 import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.protobuf.ByteString;
 import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -30,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -290,5 +295,60 @@ class BigtableToFoundationDbMigratorTest {
     final String extraRow = MANIFESTS + " " + HexFormat.of().formatHex("not-a-uuid#manifest".getBytes(StandardCharsets.UTF_8)) + " ";
     assertThat(sourceWithExtraRow.lines().filter(line -> !line.startsWith(extraRow)).map(line -> line + "\n")
         .reduce("", String::concat)).isEqualTo(sourceBefore);
+  }
+
+  /// The command's dry run opens the FoundationDB directory read-only ([FoundationDbStorage#openIfExists]) and, when
+  /// it does not exist yet, compares with nothing: it must report the same counts as against an empty directory and
+  /// leave the cluster without the directory.
+  @Test
+  void dryRunAgainstAMissingDirectoryWritesNothing() {
+    seed();
+
+    final Database database = FOUNDATION_DB.getDatabase();
+    final List<String> missing = List.of(FoundationDbExtension.TEST_ROOT, UUID.randomUUID().toString());
+    assertThat(FoundationDbStorage.openIfExists(database, missing, false).join()).isEmpty();
+
+    final ByteArrayOutputStream output = new ByteArrayOutputStream();
+    final List<TableReport> reports = new BigtableToFoundationDbMigrator(client, tables, null, missing,
+        new PrintStream(output, true, StandardCharsets.UTF_8)).run(false);
+    assertThat(print(output)).contains("DRY RUN").contains("does not exist yet").contains("OK:");
+
+    Map.of(FoundationDbStorage.GROUPS, 3L, FoundationDbStorage.GROUP_LOGS, 12L,
+        FoundationDbStorage.STORAGE_MANIFESTS, 2L, FoundationDbStorage.STORAGE_ITEMS, 40L).forEach((dataSet, count) -> {
+      final TableReport report = report(reports, dataSet);
+      assertThat(report.sourceRows()).as(dataSet).isEqualTo(count);
+      assertThat(report.targetBefore()).as(dataSet).isZero();
+      assertThat(report.copied()).as(dataSet).isEqualTo(count);
+      assertThat(report.identical() + report.conflicts() + report.unreadable()).as(dataSet).isZero();
+      assertThat(report.targetAfter()).as(dataSet).isEqualTo(-1);
+    });
+
+    // nothing was created
+    assertThat(DirectoryLayer.getDefault().exists(database, missing).join()).isFalse();
+
+    // a directory with one of its four subdirectories missing counts as missing, and is left as it is
+    final List<String> partial = List.of(FoundationDbExtension.TEST_ROOT, UUID.randomUUID().toString());
+    DirectoryLayer.getDefault().createOrOpen(database, Stream.concat(partial.stream(), Stream.of(FoundationDbStorage.GROUPS)).toList()).join();
+    try {
+      assertThat(FoundationDbStorage.openIfExists(database, partial, false).join()).isEmpty();
+      assertThat(DirectoryLayer.getDefault().exists(database,
+          Stream.concat(partial.stream(), Stream.of(FoundationDbStorage.GROUP_LOGS)).toList()).join()).isFalse();
+    } finally {
+      DirectoryLayer.getDefault().removeIfExists(database, partial).join();
+    }
+
+    // an existing directory opens read-only with the same four subdirectories
+    final FoundationDbStorage existing = FoundationDbStorage.openIfExists(database, FOUNDATION_DB.getDirectory(), false)
+        .join().orElseThrow();
+    final FoundationDbStorage created = FOUNDATION_DB.getStorage();
+    assertThat(existing.getGroups().getKey()).isEqualTo(created.getGroups().getKey());
+    assertThat(existing.getGroupLogs().getKey()).isEqualTo(created.getGroupLogs().getKey());
+    assertThat(existing.getStorageManifests().getKey()).isEqualTo(created.getStorageManifests().getKey());
+    assertThat(existing.getStorageItems().getKey()).isEqualTo(created.getStorageItems().getKey());
+
+    // copying needs the directory
+    assertThatThrownBy(() -> new BigtableToFoundationDbMigrator(client, tables, null, missing,
+        new PrintStream(OutputStream.nullOutputStream())).run(true))
+        .isInstanceOf(IllegalArgumentException.class);
   }
 }

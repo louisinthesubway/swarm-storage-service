@@ -19,14 +19,22 @@ import java.util.concurrent.CompletableFuture;
 
 public class StorageManager {
 
-  private final StorageManifestsTable manifestsTable;
-  private final StorageItemsTable     itemsTable;
+  // SWARM: typed as the store interfaces so that a second backend (FoundationDB) can serve them; upstream's
+  // constructor below still builds the Bigtable tables. See docs/SWARM-CHANGES.md, section 3.
+  private final StorageManifestsStore manifestsTable;
+  private final StorageItemsStore     itemsTable;
 
   private static final Logger log = LoggerFactory.getLogger(StorageManager.class);
 
   public StorageManager(BigtableDataClient client, String contactManifestsTableId, String contactsTableId) {
-    this.manifestsTable = new StorageManifestsTable(client, contactManifestsTableId);
-    this.itemsTable     = new StorageItemsTable(client, contactsTableId);
+    this(new StorageManifestsTable(client, contactManifestsTableId),
+         new StorageItemsTable(client, contactsTableId));
+  }
+
+  // SWARM: the backend-neutral constructor.
+  public StorageManager(StorageManifestsStore manifestsTable, StorageItemsStore itemsTable) {
+    this.manifestsTable = manifestsTable;
+    this.itemsTable     = itemsTable;
   }
 
   /**

@@ -21,7 +21,7 @@ import org.apache.commons.codec.binary.Hex;
 import org.signal.storageservice.auth.User;
 import org.signal.storageservice.storage.protos.contacts.StorageItem;
 
-public class StorageItemsTable extends Table {
+public class StorageItemsTable extends Table implements StorageItemsStore {
 
   public static final String FAMILY = "c";
   public static final String ROW_KEY = "contact";

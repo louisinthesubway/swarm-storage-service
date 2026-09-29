@@ -9,30 +9,14 @@ import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
-import com.google.api.core.ApiFutures;
-import com.google.cloud.bigtable.admin.v2.BigtableTableAdminClient;
-import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
-import com.google.cloud.bigtable.admin.v2.models.CreateTableRequest;
-import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
-import com.google.cloud.bigtable.data.v2.models.Row;
-import com.google.cloud.bigtable.data.v2.models.RowCell;
-import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.signal.libsignal.zkgroup.groups.GroupPublicParams;
 import org.signal.libsignal.zkgroup.groups.GroupSecretParams;
 import org.signal.storageservice.storage.protos.groups.AccessControl;
@@ -42,43 +26,36 @@ import org.signal.storageservice.storage.protos.groups.GroupChange.Actions;
 import org.signal.storageservice.storage.protos.groups.GroupChange.Actions.ModifyTitleAction;
 import org.signal.storageservice.storage.protos.groups.GroupChanges.GroupChangeState;
 import org.signal.storageservice.util.AuthHelper;
-import org.signal.storageservice.util.Conversions;
 
-class GroupsManagerTest {
+/// SWARM: upstream's GroupsManagerTest, run against every storage backend. The test methods are upstream's; where
+/// upstream read raw Bigtable rows, the tests ask the backend through [#storedGroup] and [#storedLogEntry]. Subclasses:
+/// [BigtableGroupsManagerTest] (upstream's emulator setup) and `FoundationDbGroupsManagerTest`. See
+/// docs/SWARM-CHANGES.md, section 3.10.
+abstract class GroupsManagerTest {
 
-  private static final String GROUPS_TABLE_NAME = "groups-table";
-  private static final TableId GROUPS_TABLE_ID = TableId.of(GROUPS_TABLE_NAME);
-
-  private static final String GROUP_LOGS_TABLE_NAME = "group-logs-table";
-  private static final TableId GROUP_LOGS_TABLE_ID = TableId.of(GROUP_LOGS_TABLE_NAME);
-
-  @RegisterExtension
-  private final BigtableEmulatorExtension bigtableEmulator = BigtableEmulatorExtension.create();
-
-  private BigtableDataClient client;
-
-  @BeforeEach
-  void setup() throws IOException {
-    BigtableTableAdminSettings.Builder tableAdminSettings = BigtableTableAdminSettings.newBuilderForEmulator(bigtableEmulator.getPort()).setProjectId("foo").setInstanceId("bar");
-    try (BigtableTableAdminClient tableAdminClient = BigtableTableAdminClient.create(tableAdminSettings.build())) {
-
-      BigtableDataSettings.Builder dataSettings = BigtableDataSettings.newBuilderForEmulator(bigtableEmulator.getPort())
-          .setProjectId("foo").setInstanceId("bar");
-      client = BigtableDataClient.create(dataSettings.build());
-
-      tableAdminClient.createTable(CreateTableRequest.of(GROUPS_TABLE_NAME).addFamily(GroupsTable.FAMILY));
-      tableAdminClient.createTable(CreateTableRequest.of(GROUP_LOGS_TABLE_NAME).addFamily(GroupLogTable.FAMILY));
-    }
+  /// What a backend stores for a group: the version as text and the `Group` bytes (Bigtable: `g:ver`, `g:gr`).
+  protected record StoredGroup(String version, ByteString groupData) {
   }
 
-  @AfterEach
-  void teardown() {
-    client.close();
+  /// What a backend stores for one log entry (Bigtable: `l:v`, `l:c`, `l:s`).
+  protected record StoredLogEntry(String version, ByteString change, ByteString state) {
   }
+
+  /// @return a manager on the backend under test
+  protected abstract GroupsManager groupsManager();
+
+  /// @return a manager whose reads of group state fail with `failure`
+  protected abstract GroupsManager groupsManagerWithFailingReads(RuntimeException failure);
+
+  /// @return what the backend stores for the group, read directly from the backend
+  protected abstract Optional<StoredGroup> storedGroup(ByteString groupId) throws Exception;
+
+  /// @return what the backend stores for the log entry, read directly from the backend
+  protected abstract Optional<StoredLogEntry> storedLogEntry(ByteString groupId, int version) throws Exception;
 
   @Test
   void testCreateGroup() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -97,21 +74,15 @@ class GroupsManagerTest {
     CompletableFuture<Boolean> result = groupsManager.createGroup(groupId, group);
     assertTrue(result.get());
 
-    Row row = client.readRow(GROUPS_TABLE_ID, groupId);
-    List<RowCell> versionCells= row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_VERSION);
+    StoredGroup stored = storedGroup(groupId).orElseThrow();
 
-    assertThat(versionCells.size()).isEqualTo(1);
-    assertThat(versionCells.getFirst().getValue().toStringUtf8()).isEqualTo("0");
-
-    List<RowCell> dataCells = row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_GROUP_DATA);
-
-    assertThat(dataCells.size()).isEqualTo(1);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isEqualTo(group);
+    assertThat(stored.version()).isEqualTo("0");
+    assertThat(Group.parseFrom(stored.groupData())).isEqualTo(group);
   }
 
   @Test
   void testCreateGroupConflict() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -143,22 +114,16 @@ class GroupsManagerTest {
     CompletableFuture<Boolean> conflicting = groupsManager.createGroup(groupId, group);
     assertFalse(conflicting.get());
 
-    Row row = client.readRow(GROUPS_TABLE_ID, groupId);
-    List<RowCell> versionCells= row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_VERSION);
+    StoredGroup stored = storedGroup(groupId).orElseThrow();
 
-    assertThat(versionCells.size()).isEqualTo(1);
-    assertThat(versionCells.getFirst().getValue().toStringUtf8()).isEqualTo("0");
-
-    List<RowCell> dataCells = row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_GROUP_DATA);
-
-    assertThat(dataCells.size()).isEqualTo(1);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isEqualTo(group);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isNotEqualTo(conflictingGroup);
+    assertThat(stored.version()).isEqualTo("0");
+    assertThat(Group.parseFrom(stored.groupData())).isEqualTo(group);
+    assertThat(Group.parseFrom(stored.groupData())).isNotEqualTo(conflictingGroup);
   }
 
   @Test
   void testUpdateGroup() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -185,22 +150,16 @@ class GroupsManagerTest {
     CompletableFuture<Optional<Group>> update = groupsManager.updateGroup(groupId, updated);
     assertThat(update.get()).isEmpty();
 
-    Row row = client.readRow(GROUPS_TABLE_ID, groupId);
-    List<RowCell> versionCells= row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_VERSION);
+    StoredGroup stored = storedGroup(groupId).orElseThrow();
 
-    assertThat(versionCells.size()).isEqualTo(1);
-    assertThat(versionCells.getFirst().getValue().toStringUtf8()).isEqualTo("1");
-
-    List<RowCell> dataCells = row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_GROUP_DATA);
-
-    assertThat(dataCells.size()).isEqualTo(1);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isEqualTo(updated);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isNotEqualTo(group);
+    assertThat(stored.version()).isEqualTo("1");
+    assertThat(Group.parseFrom(stored.groupData())).isEqualTo(updated);
+    assertThat(Group.parseFrom(stored.groupData())).isNotEqualTo(group);
   }
 
   @Test
   void testUpdateStaleGroup() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -228,22 +187,16 @@ class GroupsManagerTest {
     assertThat(update.get()).isPresent()
         .get().isEqualTo(group);
 
-    Row row = client.readRow(GROUPS_TABLE_ID, groupId);
-    List<RowCell> versionCells= row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_VERSION);
+    StoredGroup stored = storedGroup(groupId).orElseThrow();
 
-    assertThat(versionCells.size()).isEqualTo(1);
-    assertThat(versionCells.getFirst().getValue().toStringUtf8()).isEqualTo("0");
-
-    List<RowCell> dataCells = row.getCells(GroupsTable.FAMILY, GroupsTable.COLUMN_GROUP_DATA);
-
-    assertThat(dataCells.size()).isEqualTo(1);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isEqualTo(group);
-    assertThat(Group.parseFrom(dataCells.getFirst().getValue())).isNotEqualTo(updated);
+    assertThat(stored.version()).isEqualTo("0");
+    assertThat(Group.parseFrom(stored.groupData())).isEqualTo(group);
+    assertThat(Group.parseFrom(stored.groupData())).isNotEqualTo(updated);
   }
 
   @Test
   void testGetGroup() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -269,7 +222,7 @@ class GroupsManagerTest {
 
   @Test
   void testGetGroupNotFound() throws Exception {
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManager();
 
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
@@ -296,11 +249,7 @@ class GroupsManagerTest {
 
   @Test
   void testReadError() {
-    BigtableDataClient client = mock(BigtableDataClient.class);
-    when(client.readRowAsync(any(TableId.class), any(ByteString.class)))
-        .thenReturn(ApiFutures.immediateFailedFuture(new RuntimeException("Bad news")));
-
-    GroupsManager groupsManager = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager groupsManager = groupsManagerWithFailingReads(new RuntimeException("Bad news"));
 
     assertThatThrownBy(() -> groupsManager.getGroup(ByteString.copyFrom(new byte[16])).get())
         .isInstanceOf(ExecutionException.class)
@@ -308,8 +257,8 @@ class GroupsManagerTest {
   }
 
   @Test
-  void testAppendLog() throws ExecutionException, InterruptedException, InvalidProtocolBufferException {
-    GroupsManager     groupsManager     = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+  void testAppendLog() throws Exception {
+    GroupsManager     groupsManager     = groupsManager();
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
     ByteString        groupId           = ByteString.copyFrom(groupPublicParams.getGroupIdentifier().serialize());
@@ -332,26 +281,16 @@ class GroupsManagerTest {
     CompletableFuture<Boolean> insert = groupsManager.appendChangeRecord(groupId, 1, change, groupState);
     assertTrue(insert.get());
 
-    Row row = client.readRow(GROUP_LOGS_TABLE_ID, groupId.concat(ByteString.copyFromUtf8("#")).concat(ByteString.copyFrom(Conversions.intToByteArray(1))));
-    List<RowCell> versionCells = row.getCells(GroupLogTable.FAMILY, GroupLogTable.COLUMN_VERSION);
+    StoredLogEntry stored = storedLogEntry(groupId, 1).orElseThrow();
 
-    assertThat(versionCells.size()).isEqualTo(1);
-    assertThat(versionCells.getFirst().getValue().toStringUtf8()).isEqualTo("1");
-
-    List<RowCell> dataCells = row.getCells(GroupLogTable.FAMILY, GroupLogTable.COLUMN_CHANGE);
-
-    assertThat(dataCells.size()).isEqualTo(1);
-    assertThat(GroupChange.parseFrom(dataCells.getFirst().getValue())).isEqualTo(change);
-
-    List<RowCell> groupStateCells = row.getCells(GroupLogTable.FAMILY, GroupLogTable.COLUMN_STATE);
-
-    assertThat(groupStateCells.size()).isEqualTo(1);
-    assertThat(Group.parseFrom(groupStateCells.getFirst().getValue())).isEqualTo(groupState);
+    assertThat(stored.version()).isEqualTo("1");
+    assertThat(GroupChange.parseFrom(stored.change())).isEqualTo(change);
+    assertThat(Group.parseFrom(stored.state())).isEqualTo(groupState);
   }
 
   @Test
   void testQueryLog() throws ExecutionException, InterruptedException, InvalidProtocolBufferException {
-    GroupsManager     groupsManager     = new GroupsManager(client, GROUPS_TABLE_NAME, GROUP_LOGS_TABLE_NAME);
+    GroupsManager     groupsManager     = groupsManager();
     GroupSecretParams groupSecretParams = GroupSecretParams.generate();
     GroupPublicParams groupPublicParams = groupSecretParams.getPublicParams();
     ByteString        groupId           = ByteString.copyFrom(groupPublicParams.getGroupIdentifier().serialize());

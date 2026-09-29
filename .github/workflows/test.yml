@@ -10,6 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     container: ubuntu:26.04
 
+    # SWARM: a FoundationDB server for the FoundationDB backend's tests (docs/SWARM-CHANGES.md, section 3.10), the
+    # version the SWARM stack runs (swarm-messenger-server, deploy/staging/docker-compose.yml).
+    services:
+      foundationdb0:
+        image: foundationdb/foundationdb:7.3.76
+        options: --name foundationdb0
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install APT packages
@@ -17,7 +24,27 @@ jobs:
         # https://github.com/apache/maven-wrapper/issues/425
         run: |
           apt update
-          apt install -y unzip
+          apt install -y unzip curl ca-certificates
+      - name: Install the FoundationDB client library and fdbcli (SWARM)
+        # Pinned by SHA-256: the same client library checksum as pom.xml (foundationdb.client-library-sha256).
+        run: |
+          curl -fsSLo /usr/lib/libfdb_c.so https://github.com/apple/foundationdb/releases/download/7.3.76/libfdb_c.x86_64.so
+          curl -fsSLo /usr/local/bin/fdbcli https://github.com/apple/foundationdb/releases/download/7.3.76/fdbcli.x86_64
+          echo "af099848721d08904ff9e5d38fade0de24d92e86451ea491d9ab5ce84adcf62a  /usr/lib/libfdb_c.so" | sha256sum -c -
+          echo "ea72f7740524723e30ca5dd8eb98fbe86f0c43b45e5bdf052e26cf0304bc43e2  /usr/local/bin/fdbcli" | sha256sum -c -
+          chmod +x /usr/local/bin/fdbcli
+          ldconfig
+      - name: Create the FoundationDB database (SWARM)
+        run: |
+          echo "docker:docker@foundationdb0:4500" > /tmp/fdb.cluster
+          for attempt in $(seq 1 30); do
+            if fdbcli -C /tmp/fdb.cluster --exec "configure new single memory" --timeout 20 2>&1 | tee /tmp/configure.log \
+                | grep -qiE "Database created|already exists"; then
+              break
+            fi
+            sleep 2
+          done
+          fdbcli -C /tmp/fdb.cluster --exec "status minimal" --timeout 30
       - name: Set up JDK
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
@@ -29,4 +56,5 @@ jobs:
           # https://github.com/actions/setup-java/issues/356
           HOME: /root
       - name: Build with Maven
-        run: ./mvnw -e -B verify
+        # SWARM: the FoundationDB tests must run here, not be skipped (swarm.foundationdb.required)
+        run: ./mvnw -e -B verify -Dswarm.foundationdb.clusterFile=/tmp/fdb.cluster -Dswarm.foundationdb.required=true

@@ -13,7 +13,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import org.signal.storageservice.storage.protos.groups.Group;
 
-public class GroupsTable extends Table {
+public class GroupsTable extends Table implements GroupsStore {
 
   public static final String FAMILY = "g";
 

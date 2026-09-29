@@ -23,7 +23,7 @@ import org.signal.storageservice.storage.protos.groups.GroupChanges.GroupChangeS
 import org.signal.storageservice.util.Conversions;
 import org.signal.storageservice.util.Pair;
 
-public class GroupLogTable extends Table {
+public class GroupLogTable extends Table implements GroupLogStore {
 
   public static final String FAMILY = "l";
 

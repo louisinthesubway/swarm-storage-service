@@ -18,7 +18,7 @@ import java.util.concurrent.CompletableFuture;
 import org.signal.storageservice.auth.User;
 import org.signal.storageservice.storage.protos.contacts.StorageManifest;
 
-public class StorageManifestsTable extends Table {
+public class StorageManifestsTable extends Table implements StorageManifestsStore {
 
   static final String FAMILY         = "m";
 

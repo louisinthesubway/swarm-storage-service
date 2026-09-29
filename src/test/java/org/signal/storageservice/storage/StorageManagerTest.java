@@ -11,89 +11,53 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
-import com.google.api.core.ApiFutures;
-import com.google.api.gax.rpc.ServerStream;
-import com.google.cloud.bigtable.admin.v2.BigtableTableAdminClient;
-import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
-import com.google.cloud.bigtable.admin.v2.models.CreateTableRequest;
-import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
-import com.google.cloud.bigtable.data.v2.models.BulkMutation;
-import com.google.cloud.bigtable.data.v2.models.Mutation;
-import com.google.cloud.bigtable.data.v2.models.Query;
-import com.google.cloud.bigtable.data.v2.models.Row;
-import com.google.cloud.bigtable.data.v2.models.RowCell;
-import com.google.cloud.bigtable.data.v2.models.RowMutation;
-import com.google.cloud.bigtable.data.v2.models.TableId;
 import com.google.protobuf.ByteString;
-import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.IntStream;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.signal.storageservice.auth.User;
 import org.signal.storageservice.storage.protos.contacts.StorageItem;
 import org.signal.storageservice.storage.protos.contacts.StorageManifest;
 
-class StorageManagerTest {
+/// SWARM: upstream's StorageManagerTest, run against every storage backend. The test methods are upstream's; where
+/// upstream wrote or read raw Bigtable rows, the tests go through the backend hooks below. Subclasses:
+/// [BigtableStorageManagerTest] (upstream's emulator setup) and [FoundationDbStorageManagerTest]. See
+/// docs/SWARM-CHANGES.md, section 3.10.
+abstract class StorageManagerTest {
 
-  private static final String CONTACTS_TABLE_NAME = "test-table";
-  private static final TableId CONTACTS_TABLE_ID = TableId.of(CONTACTS_TABLE_NAME);
+  /// @return a manager on the backend under test
+  protected abstract StorageManager storageManager();
 
-  private static final String MANIFESTS_TABLE_NAME = "manifest-table";
-  private static final TableId MANIFESTS_TABLE_ID = TableId.of(MANIFESTS_TABLE_NAME);
+  /// @return a manager whose manifest reads fail with `failure`
+  protected abstract StorageManager storageManagerWithFailingReads(RuntimeException failure);
 
-  @RegisterExtension
-  public final BigtableEmulatorExtension bigtableEmulator = BigtableEmulatorExtension.create();
+  /// Writes a manifest directly into the backend (upstream: a raw `m:ver` + `m:dat` row).
+  protected abstract void writeRawManifest(UUID userId, String version, String data) throws Exception;
 
-  private BigtableDataClient client;
+  /// Writes items directly into the backend (upstream: raw `c:d` + `c:k` rows under `<uuid>#contact#<key>`).
+  protected abstract void writeRawItems(UUID userId, List<Map.Entry<String, String>> keysAndData) throws Exception;
 
-  @BeforeEach
-  void setup() throws IOException {
-    BigtableTableAdminSettings.Builder tableAdminSettings =
-        BigtableTableAdminSettings.newBuilderForEmulator(bigtableEmulator.getPort())
-            .setProjectId("foo")
-            .setInstanceId("bar");
+  /// @return the data of every item stored for the user, in key order, read directly from the backend
+  protected abstract List<String> rawItemData(UUID userId) throws Exception;
 
-    try (BigtableTableAdminClient tableAdminClient = BigtableTableAdminClient.create(tableAdminSettings.build())) {
-
-      tableAdminClient.createTable(CreateTableRequest.of(CONTACTS_TABLE_NAME).addFamily(StorageItemsTable.FAMILY));
-      tableAdminClient.createTable(CreateTableRequest.of(MANIFESTS_TABLE_NAME).addFamily(StorageManifestsTable.FAMILY));
-
-      BigtableDataSettings.Builder dataSettings = BigtableDataSettings.newBuilderForEmulator(bigtableEmulator.getPort())
-          .setProjectId("foo")
-          .setInstanceId("bar");
-
-      client = BigtableDataClient.create(dataSettings.build());
-    }
-  }
-
-  @AfterEach
-  void tearDown() {
-    client.close();
-  }
+  /// @return the number of items stored for the user, read directly from the backend
+  protected abstract long countRawItems(UUID userId) throws Exception;
 
   @Test
-  void testReadManifest() throws ExecutionException, InterruptedException {
+  void testReadManifest() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, userId + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "1")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest")));
+    writeRawManifest(userId, "1", "A manifest");
 
     Optional<StorageManifest> manifest = contactsManager.getManifest(user).get();
     assertTrue(manifest.isPresent());
@@ -105,17 +69,10 @@ class StorageManagerTest {
   void testGetManifestIfNotVersionDifferent() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, UUID.randomUUID() + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "4")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest other")));
-
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, userId + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "3")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest")));
+    writeRawManifest(UUID.randomUUID(), "4", "A manifest other");
+    writeRawManifest(userId, "3", "A manifest");
 
     Optional<StorageManifest> manifest = contactsManager.getManifestIfNotVersion(user, 2).get();
     assertTrue(manifest.isPresent());
@@ -127,17 +84,10 @@ class StorageManagerTest {
   void testGetManifestIfNotVersionSame() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, UUID.randomUUID() + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "4")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest other")));
-
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, userId + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "3")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest")));
+    writeRawManifest(UUID.randomUUID(), "4", "A manifest other");
+    writeRawManifest(userId, "3", "A manifest");
 
     Optional<StorageManifest> manifest = contactsManager.getManifestIfNotVersion(user, 3).get();
     assertTrue(manifest.isEmpty());
@@ -145,13 +95,9 @@ class StorageManagerTest {
 
   @Test
   void testReadError() {
-    BigtableDataClient client = mock(BigtableDataClient.class);
-    when(client.readRowAsync(any(TableId.class), any(ByteString.class))).thenReturn(
-        ApiFutures.immediateFailedFuture(new RuntimeException("Bad news")));
-
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManagerWithFailingReads(new RuntimeException("Bad news"));
 
     assertThatThrownBy(() -> contactsManager.getManifest(user).get())
         .isInstanceOf(ExecutionException.class)
@@ -162,7 +108,7 @@ class StorageManagerTest {
   void testSetEmptyManifest() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
     StorageManifest manifest = StorageManifest.newBuilder()
         .setVersion(1)
@@ -195,7 +141,7 @@ class StorageManagerTest {
   void testSetStaleManifest() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
     StorageManifest manifest = StorageManifest.newBuilder()
         .setVersion(1)
@@ -245,7 +191,7 @@ class StorageManagerTest {
   void testSetUpdatedManifest() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
     StorageManifest manifest = StorageManifest.newBuilder()
         .setVersion(1)
@@ -292,7 +238,7 @@ class StorageManagerTest {
   @Test
   void testSetNoMutations() {
     final User user = new User(UUID.randomUUID());
-    final StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    final StorageManager contactsManager = storageManager();
 
     final StorageManifest manifest = StorageManifest.newBuilder()
         .setVersion(1)
@@ -306,7 +252,7 @@ class StorageManagerTest {
   @Test
   void testSetLargeRequest() throws Exception {
     final User user = new User(UUID.randomUUID());
-    final StorageManager storageManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    final StorageManager storageManager = storageManager();
 
     final StorageManifest manifest = StorageManifest.newBuilder()
         .setVersion(1)
@@ -333,203 +279,116 @@ class StorageManagerTest {
     assertTrue(result.isEmpty());
     assertEquals(Optional.of(manifest), storageManager.getManifest(user).join());
 
-    assertEquals(insertCount,
-        client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(user.getUuid() + "#contact#")).stream().count());
+    assertEquals(insertCount, countRawItems(user.getUuid()));
   }
 
   @Test
-  void testClearItems() throws ExecutionException, InterruptedException {
+  void testClearItems() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
 
     UUID secondUserId = UUID.randomUUID();
 
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
+    final List<Map.Entry<String, String>> items = new ArrayList<>();
+    final List<Map.Entry<String, String>> secondItems = new ArrayList<>();
     for (int i = 0; i < 100; i++) {
-      client.mutateRow(
-          RowMutation.create(CONTACTS_TABLE_ID, userId + "#contact#somekey" + String.format("%03d", i),
-              Mutation.create()
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA, "data" + String.format("%03d", i))
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_KEY,
-                      "somekey" + String.format("%03d", i))));
+      items.add(Map.entry("somekey" + String.format("%03d", i), "data" + String.format("%03d", i)));
+      secondItems.add(Map.entry("somekey" + String.format("%03d", i), "seconddata" + String.format("%03d", i)));
     }
+    writeRawItems(userId, items);
+    writeRawItems(secondUserId, secondItems);
 
+    List<String> data = rawItemData(userId);
+    assertThat(data.size()).isEqualTo(100);
     for (int i = 0; i < 100; i++) {
-      client.mutateRow(
-          RowMutation.create(CONTACTS_TABLE_ID, secondUserId + "#contact#somekey" + String.format("%03d", i),
-              Mutation.create()
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA,
-                      "seconddata" + String.format("%03d", i))
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_KEY,
-                      "somekey" + String.format("%03d", i))));
+      assertThat(data.get(i)).isEqualTo("data" + String.format("%03d", i));
     }
 
-    ServerStream<Row> rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(userId + "#contact#"));
-    int i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("data" + String.format("%03d", i));
-      i++;
+    data = rawItemData(secondUserId);
+    assertThat(data.size()).isEqualTo(100);
+    for (int i = 0; i < 100; i++) {
+      assertThat(data.get(i)).isEqualTo("seconddata" + String.format("%03d", i));
     }
-
-    assertThat(i).isEqualTo(100);
-
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(secondUserId + "#contact#"));
-    i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("seconddata" + String.format("%03d", i));
-      i++;
-    }
-
-    assertThat(i).isEqualTo(100);
 
     contactsManager.clearItems(user).get();
 
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(userId + "#contact#"));
-    i = 0;
+    assertThat(rawItemData(userId).size()).isEqualTo(0);
 
-    for (Row ignored : rows) {
-      i++;
+    data = rawItemData(secondUserId);
+    assertThat(data.size()).isEqualTo(100);
+    for (int i = 0; i < 100; i++) {
+      assertThat(data.get(i)).isEqualTo("seconddata" + String.format("%03d", i));
     }
-
-    assertThat(i).isEqualTo(0);
-
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(secondUserId + "#contact#"));
-    i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("seconddata" + String.format("%03d", i));
-      i++;
-    }
-
-    assertThat(i).isEqualTo(100);
   }
 
   @Test
-  void testClearItemsLargeBatch() {
+  void testClearItemsLargeBatch() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
 
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
     for (int chunk = 0; chunk < 2; chunk++) {
-      final BulkMutation bulkMutation = BulkMutation.create(CONTACTS_TABLE_ID);
+      final List<Map.Entry<String, String>> items = new ArrayList<>();
 
       // Each setCell() is a mutation
       for (int i = 0; i < StorageItemsTable.MAX_MUTATIONS; i += StorageItemsTable.MUTATIONS_PER_INSERT) {
-        bulkMutation.add(String.format("%s#contact#somekey%d_%05d", userId, chunk, i),
-            Mutation.create()
-                .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA, "data" + String.format("%03d", i))
-                .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_KEY, "somekey" + String.format("%03d", i)));
+        items.add(Map.entry(String.format("somekey%d_%05d", chunk, i), "data" + String.format("%03d", i)));
       }
 
-      client.bulkMutateRows(bulkMutation);
+      writeRawItems(userId, items);
     }
 
     assertDoesNotThrow(() -> contactsManager.clearItems(user).join());
 
-    int remainingRows = 0;
-
-    for (final Row ignored : client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(userId + "#contact#"))) {
-      remainingRows++;
-    }
-
-    assertEquals(0, remainingRows);
+    assertEquals(0, countRawItems(userId));
   }
 
   @Test
-  void testDelete() {
+  void testDelete() throws Exception {
     UUID userId = UUID.randomUUID();
     User user = new User(userId);
 
     UUID secondUserId = UUID.randomUUID();
     User secondUser = new User(secondUserId);
 
-    StorageManager contactsManager = new StorageManager(client, MANIFESTS_TABLE_NAME, CONTACTS_TABLE_NAME);
+    StorageManager contactsManager = storageManager();
 
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, userId + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "1")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A manifest")));
+    writeRawManifest(userId, "1", "A manifest");
+    writeRawManifest(secondUserId, "1", "A different manifest");
 
-    client.mutateRow(RowMutation.create(MANIFESTS_TABLE_ID, secondUserId + "#manifest",
-        Mutation.create()
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_VERSION, "1")
-            .setCell(StorageManifestsTable.FAMILY, StorageManifestsTable.COLUMN_DATA, "A different manifest")));
-
+    final List<Map.Entry<String, String>> items = new ArrayList<>();
+    final List<Map.Entry<String, String>> secondItems = new ArrayList<>();
     for (int i = 0; i < 100; i++) {
-      client.mutateRow(
-          RowMutation.create(CONTACTS_TABLE_ID, userId + "#contact#somekey" + String.format("%03d", i),
-              Mutation.create()
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA, "data" + String.format("%03d", i))
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_KEY,
-                      "somekey" + String.format("%03d", i))));
+      items.add(Map.entry("somekey" + String.format("%03d", i), "data" + String.format("%03d", i)));
+      secondItems.add(Map.entry("somekey" + String.format("%03d", i), "seconddata" + String.format("%03d", i)));
     }
+    writeRawItems(userId, items);
+    writeRawItems(secondUserId, secondItems);
 
+    List<String> data = rawItemData(userId);
+    assertThat(data.size()).isEqualTo(100);
     for (int i = 0; i < 100; i++) {
-      client.mutateRow(
-          RowMutation.create(CONTACTS_TABLE_ID, secondUserId + "#contact#somekey" + String.format("%03d", i),
-              Mutation.create()
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA,
-                      "seconddata" + String.format("%03d", i))
-                  .setCell(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_KEY,
-                      "somekey" + String.format("%03d", i))));
+      assertThat(data.get(i)).isEqualTo("data" + String.format("%03d", i));
     }
 
-    ServerStream<Row> rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(userId + "#contact#"));
-    int i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("data" + String.format("%03d", i));
-      i++;
+    data = rawItemData(secondUserId);
+    assertThat(data.size()).isEqualTo(100);
+    for (int i = 0; i < 100; i++) {
+      assertThat(data.get(i)).isEqualTo("seconddata" + String.format("%03d", i));
     }
-
-    assertThat(i).isEqualTo(100);
-
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(secondUserId + "#contact#"));
-    i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("seconddata" + String.format("%03d", i));
-      i++;
-    }
-
-    assertThat(i).isEqualTo(100);
 
     contactsManager.delete(user).join();
 
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(userId + "#contact#"));
-    i = 0;
+    assertThat(rawItemData(userId).size()).isEqualTo(0);
 
-    for (Row ignored : rows) {
-      i++;
+    data = rawItemData(secondUserId);
+    assertThat(data.size()).isEqualTo(100);
+    for (int i = 0; i < 100; i++) {
+      assertThat(data.get(i)).isEqualTo("seconddata" + String.format("%03d", i));
     }
-
-    assertThat(i).isEqualTo(0);
-
-    rows = client.readRows(Query.create(CONTACTS_TABLE_ID).prefix(secondUserId + "#contact#"));
-    i = 0;
-
-    for (Row row : rows) {
-      List<RowCell> cells = row.getCells(StorageItemsTable.FAMILY, StorageItemsTable.COLUMN_DATA);
-      assertThat(cells.size()).isEqualTo(1);
-      assertThat(cells.getFirst().getValue().toStringUtf8()).isEqualTo("seconddata" + String.format("%03d", i));
-      i++;
-    }
-
-    assertThat(i).isEqualTo(100);
 
     assertFalse(contactsManager.getManifest(user).join().isPresent());
 

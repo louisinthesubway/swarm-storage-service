@@ -17,12 +17,20 @@ import javax.annotation.Nullable;
 
 public class GroupsManager {
 
-  private final GroupsTable   groupsTable;
-  private final GroupLogTable groupLogTable;
+  // SWARM: typed as the store interfaces so that a second backend (FoundationDB) can serve them; upstream's
+  // constructor below still builds the Bigtable tables. See docs/SWARM-CHANGES.md, section 3.
+  private final GroupsStore   groupsTable;
+  private final GroupLogStore groupLogTable;
 
   public GroupsManager(BigtableDataClient client, String groupsTableId, String groupLogsTableId) {
-    this.groupsTable   = new GroupsTable  (client, groupsTableId   );
-    this.groupLogTable = new GroupLogTable(client, groupLogsTableId);
+    this(new GroupsTable  (client, groupsTableId   ),
+         new GroupLogTable(client, groupLogsTableId));
+  }
+
+  // SWARM: the backend-neutral constructor.
+  public GroupsManager(GroupsStore groupsTable, GroupLogStore groupLogTable) {
+    this.groupsTable   = groupsTable;
+    this.groupLogTable = groupLogTable;
   }
 
   public CompletableFuture<Optional<Group>> getGroup(ByteString groupId) {

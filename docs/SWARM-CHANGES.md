@@ -5,6 +5,10 @@ This is a fork of [signalapp/storage-service](https://github.com/signalapp/stora
 unchanged; `swarm-main` (the default branch) is `upstream-main` plus the deviations on this
 page. Base: `upstream-764a105` (tag), signalapp/storage-service `main` @ `764a105`.
 
+The deviations: the configuration file takes `${VAR}` placeholders (section 1), the Bigtable
+client can target an emulator (section 2), and a second storage backend on FoundationDB,
+selected by configuration, with a command that migrates the emulator's data into it (section 3).
+
 No cryptographic primitive, no protocol code (`ServerSecretParams`, `ServerZkAuthOperations`,
 `ExternalGroupCredentialGenerator`, `GroupsController`, `StorageController`, or anything under
 `org.signal.storageservice.util.zk`) is touched by any change on this page. Group credentials
@@ -74,8 +78,19 @@ data (deployment facts, recorded here because they decide what this change is go
 
 ## 3. A FoundationDB backend for the four data sets
 
-**Status: PROPOSED (design, 2026-09-29, Opus M6c).** Written before the code; the status line is
-updated as parts are implemented and tested.
+**Status: IMPLEMENTED and TESTED, NOT DEPLOYED (2026-09-29, Opus M6c).** This section was written
+as the design before the code (commit `b4da554`) and then updated with what was measured.
+
+- Tested: the whole suite, 381 tests, against a real FoundationDB 7.3.76 (`fdbserver` in a
+  container; CI and throwaway containers on the chat host). Per backend: `GroupsManagerTest` 9 and
+  `StorageManagerTest` 12 on Bigtable (the emulator) and the same 9 and 12 on FoundationDB, plus
+  FoundationDB-only tests (3.10). The switch-over was rehearsed end to end with the deployment's
+  image in throwaway containers (swarm-messenger-server, `docs/STAGING.md` 5c, "Switching to
+  FoundationDB").
+- Not tested: a real client (the desktop) against the service on FoundationDB, a FoundationDB
+  process crash or `commit_unknown_result` in a live cluster (the retry path is tested with a
+  scripted transaction), multi-process FoundationDB clusters, and the migration of the live
+  stack's data (not run: not deployed).
 
 ### 3.1 Why
 
@@ -97,8 +112,8 @@ storage:
   foundationdb:
     clusterFile: /etc/foundationdb/fdb.cluster
     directory: [swarm-storage-service]   # a Directory-layer path; the service owns everything below it
-    transactionTimeout: 10s        # optional; covers every retry of one transaction
-    transactionRetryLimit: 100     # optional
+    transactionTimeout: PT10S      # optional (ISO-8601, the default); covers every retry of one transaction
+    transactionRetryLimit: 100     # optional (the default)
 ```
 
 - `storage.backend: bigtable` (or no `storage` block): byte-for-byte the upstream behaviour
@@ -222,19 +237,20 @@ members pending admin approval <= 1001, banned members <= 1001, member label cip
 65 bytes each):
 
 - **Group state.** One member is about 145 bytes without labels and at most about 726 bytes with
-  both labels at their maximum. A 1001-member group without labels is about 155 KB: more than one
-  value, so it is stored as two chunks. The worst case the validators allow for honest clients
-  (1001 members all with maximal labels, 1001 join requests, 1001 bans, maximal title and
-  description) is about 0.96 MB: ten chunks, one transaction of about 1 MB. A test builds that
-  group and stores, updates, logs and reads it back (3.10).
+  both labels at their maximum. A 1001-member group without labels is 145,310 bytes (measured):
+  more than one value, so it is stored as two chunks. The worst case the validators allow for
+  honest clients (1001 members all with maximal labels, 1001 join requests, 1001 bans, maximal
+  title and description) is 956,412 bytes (measured): ten chunks, one transaction of about 1 MB.
+  A test builds that group and stores, updates, logs and reads it back (3.10).
 - **Group log entry.** The state after the change plus the signed change. The largest change
-  adds or removes every member at once (about 0.15 MB, at most about 0.73 MB with labels), so one
-  append writes at most about 1.7 MB.
+  adds or removes every member at once (about 0.15 MB, at most about 0.73 MB with labels: 729,141
+  bytes measured for a thousand members with maximal labels), so one append writes at most about
+  1.7 MB.
 - **Group log read.** `GroupsController` asks for at most 64 versions per request
   (`LOG_VERSION_LIMIT`). A page reads at most 256 key-values, at most about 25 MB even if every one
-  were a full chunk, and in practice one page holds all 64 versions of a normal group (about 10 MB
-  for a 1001-member group). Reads do not count against the 10 MB write limit, and this is far
-  inside 5 s on the staging disk.
+  were a full chunk, and in practice one page holds all 64 versions of a normal group (about
+  9.3 MB for a 1001-member group). Reads do not count against the 10 MB write limit, and this is
+  far inside 5 s on the staging disk.
 - **Manifest.** Roughly 22 bytes per record identifier; it passes 100,000 bytes at about 4,500
   records and is chunked from then on. One manifest write can hold about 9.9 MB, about 450,000
   records.
@@ -314,12 +330,18 @@ FoundationDB together.
 - No change to how `cdn.*` (group avatar upload S3 POST policy signing) works; the SWARM
   deployment points it at the same MinIO bucket and key `swarm-messenger-server` already uses
   for CDN0 profile avatars (objects `groups/<group id>/<random>`).
-- No Dockerfile and no build change here. The deployment builds the service with the unchanged
+- No Dockerfile here. The deployment builds the service with the unchanged
   `./mvnw -B -DskipTests package` (a thin jar plus `target/lib/`, upstream's own
-  `copy-dependencies` execution) and wraps it in an image defined next to the deployment,
-  `deploy/staging/storage/Dockerfile` in `swarm-messenger-server`, whose base image (the digest in
-  `pom.xml`'s `docker.image`) and JVM flags mirror this repository's jib configuration. Only the
-  heap limit differs: jib's `-Xmx8192m` is sized for Signal's production.
+  `copy-dependencies` execution; since section 3 also `target/jib-extra/usr/lib/libfdb_c.so`) and
+  wraps it in an image defined next to the deployment, `deploy/staging/storage/Dockerfile` in
+  `swarm-messenger-server`, whose base image (the digest in `pom.xml`'s `docker.image`) and JVM
+  flags mirror this repository's jib configuration. Only the heap limit differs: jib's
+  `-Xmx8192m` is sized for Signal's production. The build changes of section 3 are one
+  dependency (`org.foundationdb:fdb-java`, no transitive dependencies), the client-library
+  download, and jib's `extraDirectories`.
+- Upstream's controllers (`GroupsController`, `GroupsV1Controller`, `StorageController`,
+  `ReadinessController`) and its four Bigtable table classes (one `implements` each) are
+  unchanged; the Bigtable backend is still the default.
 
 ## 5. Branches and tags
 

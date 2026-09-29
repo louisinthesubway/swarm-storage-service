@@ -33,6 +33,12 @@
         <docker.image>eclipse-temurin:25-jre-resolute@sha256:17ddcc32b1f296155738c4b2f689208e46bf0cf4eb0b215c717717deb8b74b90</docker.image>
 
         <dropwizard.version>5.0.2</dropwizard.version>
+        <!-- SWARM: the FoundationDB backend (docs/SWARM-CHANGES.md, section 3). The same client version, API version
+             and client library checksum as swarm-messenger-server's pom.xml, so both services match the stack's
+             FoundationDB 7.3.76 server. -->
+        <foundationdb.version>7.3.76</foundationdb.version>
+        <foundationdb.api-version>730</foundationdb.api-version>
+        <foundationdb.client-library-sha256>af099848721d08904ff9e5d38fade0de24d92e86451ea491d9ab5ce84adcf62a</foundationdb.client-library-sha256>
         <google-cloud-libraries.version>26.85.1</google-cloud-libraries.version>
         <jackson-bom.version>2.22.1</jackson-bom.version>
         <kotlin.version>2.4.10</kotlin.version>
@@ -160,6 +166,12 @@
         <dependency>
             <groupId>com.google.cloud</groupId>
             <artifactId>google-cloud-secretmanager</artifactId>
+        </dependency>
+        <!-- SWARM: FoundationDB backend; needs libfdb_c of the same version at runtime (downloaded below) -->
+        <dependency>
+            <groupId>org.foundationdb</groupId>
+            <artifactId>fdb-java</artifactId>
+            <version>${foundationdb.version}</version>
         </dependency>
         <dependency>
             <groupId>commons-codec</groupId>
@@ -344,6 +356,29 @@
                 </executions>
             </plugin>
             <plugin>
+                <!-- SWARM: the FoundationDB client library the Java binding loads at runtime, checked against the
+                     pinned SHA-256; the deployment image copies target/jib-extra/usr/lib/libfdb_c.so to /usr/lib
+                     (as swarm-messenger-server's build does for the chat server). -->
+                <groupId>io.github.download-maven-plugin</groupId>
+                <artifactId>download-maven-plugin</artifactId>
+                <version>2.1.0</version>
+                <executions>
+                    <execution>
+                        <id>install-foundationdb-client-library</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>wget</goal>
+                        </goals>
+                        <configuration>
+                            <url>https://github.com/apple/foundationdb/releases/download/${foundationdb.version}/libfdb_c.x86_64.so</url>
+                            <outputDirectory>${project.build.directory}/jib-extra/usr/lib</outputDirectory>
+                            <outputFileName>libfdb_c.so</outputFileName>
+                            <sha256>${foundationdb.client-library-sha256}</sha256>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-deploy-plugin</artifactId>
                 <version>3.1.4</version>
@@ -446,6 +481,14 @@
                             <port>8080</port>
                         </ports>
                     </container>
+                    <!-- SWARM: libfdb_c.so for the FoundationDB backend -->
+                    <extraDirectories>
+                        <paths>
+                            <path>
+                                <from>${project.build.directory}/jib-extra</from>
+                            </path>
+                        </paths>
+                    </extraDirectories>
                 </configuration>
             </plugin>
         </plugins>

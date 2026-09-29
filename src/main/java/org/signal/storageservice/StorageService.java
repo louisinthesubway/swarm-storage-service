@@ -9,7 +9,6 @@ import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
-import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.dropwizard.auth.AuthFilter;
@@ -35,6 +34,8 @@ import org.signal.storageservice.auth.GroupUserAuthenticator;
 import org.signal.storageservice.auth.User;
 import org.signal.storageservice.auth.UserAuthenticator;
 import org.signal.storageservice.configuration.SecretManagerConfigurationSourceProvider;
+import org.signal.storageservice.configuration.StorageBackendConfiguration;
+import org.signal.storageservice.controllers.FoundationDbReadinessController;
 import org.signal.storageservice.controllers.GroupsController;
 import org.signal.storageservice.controllers.GroupsV1Controller;
 import org.signal.storageservice.controllers.HealthCheckController;
@@ -49,10 +50,17 @@ import org.signal.storageservice.providers.ProtocolBufferMessageBodyProvider;
 import org.signal.storageservice.providers.ProtocolBufferValidationErrorMessageBodyWriter;
 import org.signal.storageservice.s3.PolicySigner;
 import org.signal.storageservice.s3.PostPolicyGenerator;
+import org.signal.storageservice.storage.BigtableClients;
 import org.signal.storageservice.storage.GroupsManager;
 import org.signal.storageservice.storage.StorageManager;
+import org.signal.storageservice.storage.foundationdb.FoundationDbGroupLogTable;
+import org.signal.storageservice.storage.foundationdb.FoundationDbGroupsTable;
+import org.signal.storageservice.storage.foundationdb.FoundationDbStorage;
+import org.signal.storageservice.storage.foundationdb.FoundationDbStorageItemsTable;
+import org.signal.storageservice.storage.foundationdb.FoundationDbStorageManifestsTable;
 import org.signal.storageservice.util.UncaughtExceptionHandler;
 import org.signal.storageservice.util.logging.LoggingUnhandledExceptionMapper;
+import org.signal.storageservice.workers.MigrateBigtableToFoundationDbCommand;
 
 public class StorageService extends Application<StorageServiceConfiguration> {
 
@@ -77,6 +85,9 @@ public class StorageService extends Application<StorageServiceConfiguration> {
       bootstrap.setConfigurationSourceProvider(new SubstitutingSourceProvider(
           bootstrap.getConfigurationSourceProvider(), new EnvironmentVariableSubstitutor(false)));
     }
+
+    // SWARM: copies the four Bigtable tables into the FoundationDB backend. See docs/SWARM-CHANGES.md, section 3.9.
+    bootstrap.addCommand(new MigrateBigtableToFoundationDbCommand());
   }
 
   @Override
@@ -86,33 +97,34 @@ public class StorageService extends Application<StorageServiceConfiguration> {
 
     UncaughtExceptionHandler.register();
 
-    // SWARM: a self-hosted deployment has no Google Cloud project, so point the Bigtable client at
-    // an emulator (docs/STAGING.md, section 5c) when BIGTABLE_EMULATOR_HOST is set, instead of the
-    // real Bigtable Data API newBuilder() always dials. newBuilderForEmulator() is upstream's own
-    // supported entry point for this (used by BigtableEmulatorExtension in this repo's own tests);
-    // nothing about the zkgroup or authentication code below changes. See docs/SWARM-CHANGES.md.
-    final String bigtableEmulatorHost = System.getenv("BIGTABLE_EMULATOR_HOST");
-    final BigtableDataSettings.Builder bigtableDataSettingsBuilder;
-    if (StringUtils.isNotBlank(bigtableEmulatorHost)) {
-      final String[] hostAndPort = bigtableEmulatorHost.split(":", 2);
-      if (hostAndPort.length != 2) {
-        throw new IllegalArgumentException(
-            "BIGTABLE_EMULATOR_HOST must be host:port, was: " + bigtableEmulatorHost);
-      }
-      bigtableDataSettingsBuilder = BigtableDataSettings.newBuilderForEmulator(hostAndPort[0],
-          Integer.parseInt(hostAndPort[1]));
+    // SWARM: groups, group logs and storage records live either in Bigtable (upstream; with SWARM's emulator
+    // support in BigtableClients) or in FoundationDB (storage.backend: foundationdb). Nothing about the zkgroup or
+    // authentication code below changes. See docs/SWARM-CHANGES.md, sections 2 and 3.
+    final StorageManager storageManager;
+    final GroupsManager  groupsManager;
+    final Object         readinessController;
+
+    if (config.getStorageBackendConfiguration().getBackend() == StorageBackendConfiguration.Backend.FOUNDATIONDB) {
+      final FoundationDbStorage foundationDbStorage =
+          FoundationDbStorage.open(config.getStorageBackendConfiguration().getFoundationDbConfiguration(), true);
+      environment.lifecycle().manage(foundationDbStorage);
+
+      storageManager      = new StorageManager(new FoundationDbStorageManifestsTable(foundationDbStorage), new FoundationDbStorageItemsTable(foundationDbStorage));
+      groupsManager       = new GroupsManager(new FoundationDbGroupsTable(foundationDbStorage), new FoundationDbGroupLogTable(foundationDbStorage));
+      readinessController = new FoundationDbReadinessController(foundationDbStorage, config.getWarmUpConfiguration().count());
     } else {
-      bigtableDataSettingsBuilder = BigtableDataSettings.newBuilder();
+      BigtableDataClient bigtableDataClient = BigtableClients.create(config.getBigTableConfiguration());
+      storageManager      = new StorageManager(bigtableDataClient, config.getBigTableConfiguration().getContactManifestsTableId(), config.getBigTableConfiguration().getContactsTableId());
+      groupsManager       = new GroupsManager(bigtableDataClient, config.getBigTableConfiguration().getGroupsTableId(), config.getBigTableConfiguration().getGroupLogsTableId());
+      readinessController = new ReadinessController(bigtableDataClient,
+          Set.of(config.getBigTableConfiguration().getGroupsTableId(),
+              config.getBigTableConfiguration().getGroupLogsTableId(),
+              config.getBigTableConfiguration().getContactsTableId(),
+              config.getBigTableConfiguration().getContactManifestsTableId()),
+          config.getWarmUpConfiguration().count());
     }
 
-    BigtableDataSettings bigtableDataSettings = bigtableDataSettingsBuilder
-                                                                    .setProjectId(config.getBigTableConfiguration().getProjectId())
-                                                                    .setInstanceId(config.getBigTableConfiguration().getInstanceId())
-                                                                    .build();
-    BigtableDataClient bigtableDataClient = BigtableDataClient.create(bigtableDataSettings);
     ServerSecretParams serverSecretParams = new ServerSecretParams(config.getZkConfiguration().getServerSecret());
-    StorageManager     storageManager     = new StorageManager(bigtableDataClient, config.getBigTableConfiguration().getContactManifestsTableId(), config.getBigTableConfiguration().getContactsTableId());
-    GroupsManager      groupsManager      = new GroupsManager(bigtableDataClient, config.getBigTableConfiguration().getGroupsTableId(), config.getBigTableConfiguration().getGroupLogsTableId());
 
     environment.getObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     environment.getObjectMapper().setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE);
@@ -141,12 +153,7 @@ public class StorageService extends Application<StorageServiceConfiguration> {
     environment.jersey().register(new TimestampResponseFilter(Clock.systemUTC()));
 
     environment.jersey().register(new HealthCheckController());
-    environment.jersey().register(new ReadinessController(bigtableDataClient,
-        Set.of(config.getBigTableConfiguration().getGroupsTableId(),
-            config.getBigTableConfiguration().getGroupLogsTableId(),
-            config.getBigTableConfiguration().getContactsTableId(),
-            config.getBigTableConfiguration().getContactManifestsTableId()),
-        config.getWarmUpConfiguration().count()));
+    environment.jersey().register(readinessController);
     environment.jersey().register(new StorageController(storageManager));
     environment.jersey().register(new GroupsController(Clock.systemUTC(), groupsManager, serverSecretParams, policySigner, postPolicyGenerator, config.getGroupConfiguration(), externalGroupCredentialGenerator));
     environment.jersey().register(new GroupsV1Controller(Clock.systemUTC(), groupsManager, serverSecretParams, policySigner, postPolicyGenerator, config.getGroupConfiguration(), externalGroupCredentialGenerator));
